@@ -1,59 +1,101 @@
-# 🐺 QA Wolf Take Home Assignment
+# Hacker News Sort Order Validator
 
-Welcome to the QA Wolf take home assignment for our [QA Engineer](https://www.task-wolf.com/apply-qae) role! We appreciate your interest and look forward to seeing what you come up with.
+A Playwright script that validates the first 100 articles on [Hacker News /newest](https://news.ycombinator.com/newest) are sorted from newest to oldest.
 
-## Instructions
+Built for the [QA Wolf](https://www.qawolf.com/) QA Engineer take-home assignment.
 
-This assignment has two questions as outlined below. When you are done, upload your assignment to our [application page](https://www.task-wolf.com/apply-qae):
+## Quick Start
 
+```bash
+npm install
+npx playwright install --with-deps chromium
+npm test
+```
 
-### Question 1
+The script navigates through HN's `/newest` page, collects 100 articles, and verifies their timestamps are in descending order. On success it exits with code 0; on failure it exits with code 1, prints the violations with surrounding context, and saves a screenshot of the page.
 
-In this assignment, you will create a script on [Hacker News](https://news.ycombinator.com/) using JavaScript and Microsoft's [Playwright](https://playwright.dev/) framework. 
+You can validate a different number of articles by passing a count:
 
-1. Install node modules by running `npm i`.
+```bash
+npx tsx index.ts 200
+```
 
-2. Edit the `index.js` file in this project to go to [Hacker News/newest](https://news.ycombinator.com/newest) and validate that EXACTLY the first 100 articles are sorted from newest to oldest. You can run your script with the `node index.js` command.
+## Output
 
-Note that you are welcome to update Playwright or install other packages as you see fit, however you must utilize Playwright in this assignment.
+Every run produces a `results.json` file with structured pass/fail data:
 
-### Question 2
+```json
+{
+  "timestamp": "2026-03-03T12:00:00.000Z",
+  "targetCount": 100,
+  "articleCount": 100,
+  "tieCount": 12,
+  "passed": true,
+  "violations": []
+}
+```
 
-Why do you want to work at QA Wolf? Please record a short, ~2 min video using [Loom](https://www.loom.com/) that includes:
+When violations are detected, the script also saves `failure.png` — a screenshot of the page at the time validation ran.
 
-1. Your answer 
+A failing run prints a context window around each violation so the pattern is visible at a glance:
 
-2. A walk-through demonstration of your code, showing a successful execution
+```
+  Violation at position 42:
+    [40] 2026-03-03T09:12:00  "Some earlier article title..."
+    [41] 2026-03-03T09:11:00  "Another article..."
+  > [42] 2026-03-03T09:08:00  "This one is older..."
+  > [43] 2026-03-03T09:10:00  "But this one is newer — violation"
+    [44] 2026-03-03T09:07:00  "Continues normally..."
+```
 
-The answer and walkthrough should be combined into *one* video, and must be recorded using Loom as the submission page only accepts Loom links.
+## Running Tests
 
-## Frequently Asked Questions
+Unit tests validate the sort-order logic in isolation without launching a browser or hitting the network:
 
-### What is your hiring process? When will I hear about next steps?
+```bash
+npm run test:unit
+```
 
-This take home assignment is the first step in our hiring process, followed by a final round interview if it goes well. **We review every take home assignment submission and promise to get back to you either way within two weeks (usually sooner).** The only caveat is if we are out of the office, in which case we will get back to you when we return. If it has been more than two weeks and you have not heard from us, please do follow up.
+The test suite covers: clean descending order, single violations, tied timestamps, multiple violations, and correct context window marking.
 
-The final round interview is a 2-hour technical work session that reflects what it is like to work here. We provide a $150 stipend for your time for the final round interview regardless of how it goes. After that, there may be a short chat with our director about your experience and the role.
+## Project Structure
 
-Our hiring process is rolling where we review candidates until we have filled our openings. If there are no openings left, we will keep your contact information on file and reach out when we are hiring again.
+```
+├── index.ts              # Entry point — scrapes HN and runs validation
+├── lib/
+│   └── validate.ts       # Sort validation logic and types (Article, Violation)
+├── test/
+│   └── validate.test.ts  # Unit tests for validation logic
+├── .github/
+│   └── workflows/
+│       └── test.yml      # CI pipeline
+├── results.json          # Generated on each run
+└── failure.png           # Generated on validation failure
+```
 
-### Having trouble uploading your assignment?
-Be sure to delete your `node_modules` file, then zip your assignment folder prior to upload. 
+`validate.ts` is extracted into its own module so it can be imported and tested without triggering the browser-based entry point in `index.ts`.
 
-### How do you decide who to hire?
+## CI Pipeline
 
-We evaluate candidates based on three criteria:
+The GitHub Actions workflow (`.github/workflows/test.yml`) runs on two triggers:
 
-- Technical ability (as demonstrated in the take home and final round)
-- Customer service orientation (as this role is customer facing)
-- Alignment with our mission and values (captured [here](https://qawolf.notion.site/Mission-and-Values-859c7d0411ba41349e1b318f4e7abc8f))
+- **Pull requests to main** — gates code changes before merge.
+- **Daily at 6:00 AM UTC** — monitors HN's sort order as a live system under continuous validation.
 
-This means whether we hire you is based on how you do during our interview process, not on your previous experience (or lack thereof). Note that you will also need to pass a background check to work here as our customers require this.
+Each run executes unit tests first (fast feedback if logic is broken), then the full Playwright validation. Both `results.json` and `failure.png` are uploaded as CI artifacts on every run, whether it passes or fails.
 
-### How can I help my application stand out?
+The workflow pins `ubuntu-22.04` because Playwright's `--with-deps` installer references package names that were renamed in Ubuntu 24.04.
 
-While the assignment has clear requirements, we encourage applicants to treat it as more than a checklist. If you're genuinely excited about QA Wolf, consider going a step further—whether that means building a simple user interface, adding detailed error handling or reporting, improving the structure of the script, or anything else that showcases your unique perspective.
+## Design Decisions
 
-There's no "right" answer—we're curious to see what you choose to do when given freedom and ambiguity. In a world where tools can help generate working code quickly and make it easier than ever to complete technical take-homes, we value originality and intentionality. If that resonates with you, use this assignment as a chance to show us how you think.
+**Single browser.** The original version ran four browsers in parallel. Cross-browser testing matters when validating your own application's rendering — not when reading server-rendered text from someone else's page. HN serves identical HTML regardless of engine.
 
-Applicants who approach the assignment as a creative challenge, not just a checklist, tend to perform best in our process.
+**Timestamp parsing.** HN's `.age` element stores timestamps as `"2026-03-03T20:56:56 1772571416"` — an ISO datetime followed by a Unix epoch. `new Date()` on the raw string produces `Invalid Date`, and comparisons on invalid dates silently return `false`. The script strips the trailing epoch before parsing and throws immediately if any timestamp is unparseable.
+
+**Tie handling.** HN timestamps have minute-level resolution, so consecutive articles frequently share the same timestamp. Ties are valid because they don't violate newest-to-oldest ordering. The script counts and logs them explicitly rather than ignoring them silently.
+
+**Retry logic.** Network requests are wrapped in a retry helper (3 attempts, 2-second backoff). A single transient timeout no longer kills the entire run.
+
+**Screenshot on failure.** Attaching visual evidence is standard QA practice so someone debugging doesn't need to reproduce the run to see what happened.
+
+**Data validation at parse time.** Every scraped article is checked for a non-empty title and a valid timestamp before entering the article list. If HN's markup changes, the script fails immediately with a clear message instead of carrying bad data through to comparison.
