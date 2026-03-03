@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "npx tsx index.ts",
+    "test:unit": "npx tsx test/validate.test.ts",
     "start": "npx tsx index.ts"
   },
   "keywords": [],

@@ -1,19 +1,7 @@
 // EDIT THIS FILE TO COMPLETE ASSIGNMENT QUESTION 1
 import { writeFileSync } from "fs";
 import { chromium, type Page } from "playwright";
-
-/** A single Hacker News article scraped from the page, with a validated date. */
-interface Article {
-  title: string;
-  timestamp: string;
-  date: Date;
-}
-
-/** A sort order violation with surrounding context lines. */
-interface Violation {
-  position: number;  // 1-based index of the older article in the violating pair
-  context: string[]; // formatted lines showing articles around the violation
-}
+import { validateSortOrder, type Article, type Violation } from "./lib/validate.js";
 
 /**
  * Parses the article count from the CLI argument.
@@ -101,48 +89,6 @@ async function scrapeArticles(page: Page, limit: number): Promise<Article[]> {
 }
 
 /**
- * Validates that `articles` are sorted from newest to oldest.
- *
- * Ties (consecutive articles sharing the same minute-resolution timestamp) are
- * valid — HN groups simultaneous submissions together. They are counted and
- * reported but do not constitute a failure.
- *
- * For each violation, a 2-article context window before and after the
- * offending pair is included so the failure pattern is visible at a glance.
- */
-function validateSortOrder(articles: Article[]): { violations: Violation[]; tieCount: number } {
-  const violations: Violation[] = [];
-  let tieCount = 0;
-
-  for (let i = 0; i < articles.length - 1; i++) {
-    const curr = articles[i]!;
-    const next = articles[i + 1]!;
-
-    if (curr.date.getTime() === next.date.getTime()) {
-      tieCount++;
-      continue;
-    }
-
-    if (curr.date < next.date) {
-      // curr is older than next — sort order violated
-      const windowStart = Math.max(0, i - 2);
-      const windowEnd = Math.min(articles.length - 1, i + 3);
-
-      // 1-based positions of the violating pair: i+1 and i+2
-      const context = articles.slice(windowStart, windowEnd + 1).map((a, idx) => {
-        const pos = windowStart + idx + 1;
-        const marker = pos === i + 1 || pos === i + 2 ? ">" : " ";
-        return `  ${marker} [${String(pos).padStart(3)}] ${a.timestamp}  "${a.title.slice(0, 60)}"`;
-      });
-
-      violations.push({ position: i + 1, context });
-    }
-  }
-
-  return { violations, tieCount };
-}
-
-/**
  * Entry point. Paginates through HN /newest, collects `targetCount` articles,
  * validates their sort order, writes results.json, and exits with code 1 on failure.
  */
@@ -155,6 +101,9 @@ async function main(): Promise<void> {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
   const articles: Article[] = [];
+  let violations: Violation[] = [];
+  let tieCount = 0;
+  let screenshotTaken = false;
 
   try {
     await withRetry(() =>
@@ -194,6 +143,16 @@ async function main(): Promise<void> {
         pageNum++;
       }
     }
+
+    // Validate while the page is still open so we can screenshot on failure.
+    if (articles.length >= targetCount) {
+      ({ violations, tieCount } = validateSortOrder(articles));
+
+      if (violations.length > 0) {
+        await page.screenshot({ path: "failure.png", fullPage: false });
+        screenshotTaken = true;
+      }
+    }
   } finally {
     await browser.close();
   }
@@ -203,7 +162,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const { violations, tieCount } = validateSortOrder(articles);
   const durationMs = Date.now() - start;
   const passed = violations.length === 0;
 
@@ -212,6 +170,7 @@ async function main(): Promise<void> {
   console.log(`Ties:       ${tieCount} (same-minute timestamps — valid per HN's resolution)`);
   console.log(`Violations: ${violations.length}`);
   console.log(`Duration:   ${(durationMs / 1000).toFixed(2)}s`);
+  if (screenshotTaken) console.log(`Screenshot: failure.png`);
 
   if (violations.length > 0) {
     console.log(`\nSort order violations:\n`);

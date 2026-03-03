@@ -1,8 +1,6 @@
 name: HN Sort Validation
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   schedule:
@@ -27,6 +25,9 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
+      - name: Run unit tests
+        run: npm run test:unit
+
       - name: Run validation
         run: npm test
 
@@ -36,3 +37,10 @@ jobs:
         with:
           name: results-${{ github.run_id }}
           path: results.json
+
+      - name: Upload failure screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-screenshot-${{ github.run_id }}
+          path: failure.png
