@@ -1,4 +1,5 @@
 // EDIT THIS FILE TO COMPLETE ASSIGNMENT QUESTION 1
+import { writeFileSync } from "fs";
 import { chromium, firefox, webkit, type Browser, type Page } from "playwright";
 
 /** A single Hacker News article scraped from the page. */
@@ -204,6 +205,23 @@ async function main(): Promise<void> {
   console.log(bar);
   console.log(` Total wall time: ${(wallMs / 1000).toFixed(2)}s (ran in parallel)`);
   console.log(`${bar}\n`);
+
+  const allPassed = results.every((r) => r.passed);
+  const report = {
+    timestamp: new Date().toISOString(),
+    targetCount,
+    results: results.map((r) => ({
+      browser: r.browserName,
+      passed: r.passed,
+      durationMs: r.durationMs,
+      failures: r.failures,
+    })),
+    allPassed,
+  };
+
+  const reportPath = "results.json";
+  writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  console.log(`Report written to ${reportPath}\n`);
 
   const failedBrowsers = results.filter((r) => !r.passed);
   if (failedBrowsers.length > 0) {
