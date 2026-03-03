@@ -1,33 +1,23 @@
 // EDIT THIS FILE TO COMPLETE ASSIGNMENT QUESTION 1
 import { writeFileSync } from "fs";
-import { chromium, firefox, webkit, type Browser, type Page } from "playwright";
+import { chromium, type Page } from "playwright";
 
-/** A single Hacker News article scraped from the page. */
+/** A single Hacker News article scraped from the page, with a validated date. */
 interface Article {
   title: string;
   timestamp: string;
+  date: Date;
 }
 
-/** The validation result for a single browser run. */
-interface BrowserResult {
-  browserName: string;
-  passed: boolean;
-  failures: string[];
-  articleCount: number;
-  durationMs: number;
-}
-
-/** A browser configuration entry describing how to launch it. */
-interface BrowserConfig {
-  name: string;
-  launch: () => Promise<Browser>;
+/** A sort order violation with surrounding context lines. */
+interface Violation {
+  position: number;  // 1-based index of the older article in the violating pair
+  context: string[]; // formatted lines showing articles around the violation
 }
 
 /**
  * Parses the article count from the CLI argument.
  * Defaults to 100 if no argument is provided.
- *
- * @returns The number of articles to validate.
  */
 function parseArticleCount(): number {
   const arg = process.argv[2];
@@ -42,73 +32,151 @@ function parseArticleCount(): number {
 }
 
 /**
- * Scrapes up to `limit` articles from the current Hacker News page.
- *
- * @param page - The Playwright page object, already navigated to an HN /newest page.
- * @param limit - Maximum number of articles to extract from this page.
- * @returns An array of articles with their titles and ISO timestamps.
+ * Retries an async operation up to `attempts` times with a fixed backoff.
+ * A single network hiccup should not fail the entire run.
  */
-async function scrapeArticles(page: Page, limit: number): Promise<Article[]> {
-  return page.$$eval(
-    ".athing",
-    (rows, limit) => {
-      return rows.slice(0, limit).map((row) => {
-        const subtext = row.nextElementSibling;
-        const ageEl = subtext?.querySelector(".age");
-        const title = row.querySelector(".titleline a")?.textContent ?? "Unknown";
-        const timestamp = ageEl?.getAttribute("title") ?? "";
-        return { title, timestamp };
-      });
-    },
-    limit
-  );
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  backoffMs = 2000
+): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (i < attempts - 1) {
+        console.warn(`  Attempt ${i + 1} failed, retrying in ${backoffMs}ms...`);
+        await new Promise((res) => setTimeout(res, backoffMs));
+      }
+    }
+  }
+  throw lastError;
 }
 
 /**
- * Launches a browser, paginates through Hacker News /newest to collect
- * `targetCount` articles, and validates they are sorted newest to oldest.
+ * Scrapes up to `limit` articles from the current HN page.
  *
- * @param launchFn - A function that launches and returns a Playwright Browser.
- * @param browserName - Display name of the browser (used in log prefixes).
- * @param targetCount - Number of articles to collect and validate.
- * @returns A BrowserResult with pass/fail status, failures, and timing.
+ * Throws immediately if any article has an empty title or an unparseable
+ * timestamp. Bad data should fail loudly rather than silently skewing results —
+ * `new Date("")` produces an Invalid Date whose comparisons always return false,
+ * which would cause sort violations to go undetected.
  */
-async function runForBrowser(
-  launchFn: () => Promise<Browser>,
-  browserName: string,
-  targetCount: number
-): Promise<BrowserResult> {
-  const tag = `[${browserName}]`;
-  const start = Date.now();
-  const browser = await launchFn();
-  const context = await browser.newContext();
-  const page = await context.newPage();
+async function scrapeArticles(page: Page, limit: number): Promise<Article[]> {
+  const raw = await page.$$eval(
+    ".athing",
+    (rows, limit) =>
+      rows.slice(0, limit).map((row) => {
+        const subtext = row.nextElementSibling;
+        const ageEl = subtext?.querySelector(".age");
+        return {
+          title: row.querySelector(".titleline a")?.textContent ?? "",
+          timestamp: ageEl?.getAttribute("title") ?? "",
+        };
+      }),
+    limit
+  );
 
+  const articles: Article[] = [];
+  for (const { title, timestamp: rawTimestamp } of raw) {
+    if (!title) {
+      throw new Error(
+        `Scraped an article with an empty title — HN's page structure may have changed.`
+      );
+    }
+    // HN's title attribute format is "ISO-datetime unix-epoch"
+    // (e.g. "2026-03-03T20:56:56 1772571416"). Extract just the ISO part.
+    const timestamp = rawTimestamp.split(" ")[0] ?? "";
+    if (!timestamp || isNaN(Date.parse(timestamp))) {
+      throw new Error(
+        `Article "${title}" has an unparseable timestamp: "${rawTimestamp}". ` +
+          `HN's page structure may have changed.`
+      );
+    }
+    articles.push({ title, timestamp, date: new Date(timestamp) });
+  }
+
+  return articles;
+}
+
+/**
+ * Validates that `articles` are sorted from newest to oldest.
+ *
+ * Ties (consecutive articles sharing the same minute-resolution timestamp) are
+ * valid — HN groups simultaneous submissions together. They are counted and
+ * reported but do not constitute a failure.
+ *
+ * For each violation, a 2-article context window before and after the
+ * offending pair is included so the failure pattern is visible at a glance.
+ */
+function validateSortOrder(articles: Article[]): { violations: Violation[]; tieCount: number } {
+  const violations: Violation[] = [];
+  let tieCount = 0;
+
+  for (let i = 0; i < articles.length - 1; i++) {
+    const curr = articles[i]!;
+    const next = articles[i + 1]!;
+
+    if (curr.date.getTime() === next.date.getTime()) {
+      tieCount++;
+      continue;
+    }
+
+    if (curr.date < next.date) {
+      // curr is older than next — sort order violated
+      const windowStart = Math.max(0, i - 2);
+      const windowEnd = Math.min(articles.length - 1, i + 3);
+
+      // 1-based positions of the violating pair: i+1 and i+2
+      const context = articles.slice(windowStart, windowEnd + 1).map((a, idx) => {
+        const pos = windowStart + idx + 1;
+        const marker = pos === i + 1 || pos === i + 2 ? ">" : " ";
+        return `  ${marker} [${String(pos).padStart(3)}] ${a.timestamp}  "${a.title.slice(0, 60)}"`;
+      });
+
+      violations.push({ position: i + 1, context });
+    }
+  }
+
+  return { violations, tieCount };
+}
+
+/**
+ * Entry point. Paginates through HN /newest, collects `targetCount` articles,
+ * validates their sort order, writes results.json, and exits with code 1 on failure.
+ */
+async function main(): Promise<void> {
+  const targetCount = parseArticleCount();
+  const start = Date.now();
+
+  console.log(`Validating ${targetCount} articles on Hacker News /newest...\n`);
+
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
   const articles: Article[] = [];
 
   try {
-    console.log(`${tag} Navigating to Hacker News /newest...`);
-    await page.goto("https://news.ycombinator.com/newest", {
-      waitUntil: "domcontentloaded",
-    });
+    await withRetry(() =>
+      page.goto("https://news.ycombinator.com/newest", { waitUntil: "domcontentloaded" })
+    );
 
     let pageNum = 1;
 
     while (articles.length < targetCount) {
-      await page.waitForSelector(".athing", { timeout: 10000 });
+      await withRetry(() => page.waitForSelector(".athing", { timeout: 10000 }));
 
-      const articlesOnPage = await page.$$eval(".athing", (rows) => rows.length);
-      const remaining = targetCount - articles.length;
-      const toTake = Math.min(articlesOnPage, remaining);
-      const pageArticles = await scrapeArticles(page, toTake);
+      const onPage = await page.$$eval(".athing", (rows) => rows.length);
+      const toTake = Math.min(onPage, targetCount - articles.length);
+      const batch = await scrapeArticles(page, toTake);
 
-      if (pageArticles.length === 0) {
-        console.error(`${tag} No articles found on page ${pageNum}. Stopping.`);
+      if (batch.length === 0) {
+        console.error(`No articles found on page ${pageNum}. Stopping.`);
         break;
       }
 
-      articles.push(...pageArticles);
-      console.log(`${tag} Page ${pageNum}: collected ${articles.length}/${targetCount} articles`);
+      articles.push(...batch);
+      console.log(`Page ${pageNum}: collected ${articles.length}/${targetCount} articles`);
 
       if (articles.length < targetCount) {
         const moreHref = await page
@@ -116,13 +184,13 @@ async function runForBrowser(
           .catch(() => null);
 
         if (!moreHref) {
-          console.error(`${tag} No "More" link found on page ${pageNum}. Only ${articles.length} articles available.`);
+          console.error(`No "More" link on page ${pageNum}. Only ${articles.length} articles available.`);
           break;
         }
 
-        await page.goto(`https://news.ycombinator.com/${moreHref}`, {
-          waitUntil: "domcontentloaded",
-        });
+        await withRetry(() =>
+          page.goto(`https://news.ycombinator.com/${moreHref}`, { waitUntil: "domcontentloaded" })
+        );
         pageNum++;
       }
     }
@@ -130,108 +198,43 @@ async function runForBrowser(
     await browser.close();
   }
 
-  const durationMs = Date.now() - start;
-
   if (articles.length < targetCount) {
-    return {
-      browserName,
-      passed: false,
-      failures: [`Expected ${targetCount} articles but only collected ${articles.length}.`],
-      articleCount: articles.length,
-      durationMs,
-    };
+    console.error(`\nFailed: expected ${targetCount} articles but only collected ${articles.length}.`);
+    process.exit(1);
   }
 
-  const failures: string[] = [];
+  const { violations, tieCount } = validateSortOrder(articles);
+  const durationMs = Date.now() - start;
+  const passed = violations.length === 0;
 
-  for (let i = 0; i < articles.length - 1; i++) {
-    const current = new Date(articles[i]!.timestamp);
-    const next = new Date(articles[i + 1]!.timestamp);
+  console.log(`\nResult:     ${passed ? "✅ PASS" : "❌ FAIL"}`);
+  console.log(`Articles:   ${articles.length}`);
+  console.log(`Ties:       ${tieCount} (same-minute timestamps — valid per HN's resolution)`);
+  console.log(`Violations: ${violations.length}`);
+  console.log(`Duration:   ${(durationMs / 1000).toFixed(2)}s`);
 
-    if (current < next) {
-      failures.push(
-        `Article ${i + 1} ("${articles[i]!.title.slice(0, 40)}") is OLDER than ` +
-        `article ${i + 2} ("${articles[i + 1]!.title.slice(0, 40)}")\n` +
-        `  ${articles[i]!.timestamp} < ${articles[i + 1]!.timestamp}`
-      );
+  if (violations.length > 0) {
+    console.log(`\nSort order violations:\n`);
+    for (const v of violations) {
+      console.log(`  Violation at position ${v.position}:`);
+      for (const line of v.context) console.log(line);
+      console.log();
     }
   }
 
-  return {
-    browserName,
-    passed: failures.length === 0,
-    failures,
-    articleCount: articles.length,
-    durationMs,
-  };
-}
-
-/**
- * Entry point. Parses CLI args, runs all browsers in parallel,
- * and prints a summary report with per-browser timing.
- */
-async function main(): Promise<void> {
-  const targetCount = parseArticleCount();
-  const wallStart = Date.now();
-
-  const BROWSERS: BrowserConfig[] = [
-    { name: "Firefox",        launch: () => firefox.launch({ headless: true }) },
-    { name: "WebKit",         launch: () => webkit.launch({ headless: true }) },
-    { name: "Chromium",       launch: () => chromium.launch({ headless: true}) },
-    { name: "Microsoft Edge", launch: () => chromium.launch({ channel: "msedge", headless: true }) },
-  ];
-
-  console.log(`Starting validation of ${targetCount} articles across ${BROWSERS.length} browsers in parallel...\n`);
-
-  const results = await Promise.all(
-    BROWSERS.map(({ name, launch }) => runForBrowser(launch, name, targetCount))
-  );
-
-  const wallMs = Date.now() - wallStart;
-  const bar = "═".repeat(52);
-
-  console.log(`\n${bar}`);
-  console.log(` RESULTS  (${targetCount} articles, ${BROWSERS.length} browsers)`);
-  console.log(bar);
-  console.log(` ${"Browser".padEnd(18)} ${"Status".padEnd(10)} Time`);
-  console.log(` ${"-".repeat(18)} ${"-".repeat(10)} ------`);
-
-  for (const r of results) {
-    const status = r.passed ? "✅ PASS" : "❌ FAIL";
-    const time = `${(r.durationMs / 1000).toFixed(2)}s`;
-    console.log(` ${r.browserName.padEnd(18)} ${status.padEnd(10)} ${time}`);
-  }
-
-  console.log(bar);
-  console.log(` Total wall time: ${(wallMs / 1000).toFixed(2)}s (ran in parallel)`);
-  console.log(`${bar}\n`);
-
-  const allPassed = results.every((r) => r.passed);
   const report = {
     timestamp: new Date().toISOString(),
     targetCount,
-    results: results.map((r) => ({
-      browser: r.browserName,
-      passed: r.passed,
-      durationMs: r.durationMs,
-      failures: r.failures,
-    })),
-    allPassed,
+    articleCount: articles.length,
+    tieCount,
+    passed,
+    violations: violations.map((v) => ({ position: v.position, context: v.context })),
   };
 
-  const reportPath = "results.json";
-  writeFileSync(reportPath, JSON.stringify(report, null, 2));
-  console.log(`Report written to ${reportPath}\n`);
+  writeFileSync("results.json", JSON.stringify(report, null, 2));
+  console.log(`\nReport written to results.json`);
 
-  const failedBrowsers = results.filter((r) => !r.passed);
-  if (failedBrowsers.length > 0) {
-    for (const r of failedBrowsers) {
-      console.log(`Failures in ${r.browserName}:`);
-      r.failures.forEach((f) => console.log(`  ❌ ${f}`));
-      console.log();
-    }
-    process.exit(1);
-  }
+  if (!passed) process.exit(1);
 }
 
 void main();
